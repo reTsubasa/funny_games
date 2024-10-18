@@ -21,10 +21,10 @@ wifi_psk = ""   #wifi pass
 
 
 #mqtt args
-mqtt_user = "7x5te99kcd9a6c1f"                      #mqtt user name
-mqtt_pass = "Iq4NbctlTQ"                            #mqtt user pass
-mqtt_host = "mqtt://sh-3-mqtt.iot-api.com:1883"     #mqtt endpoint
-mqtt_clientid = "6bcxovwq"                          #mqtt client id
+mqtt_user = "xxxxxx"                      #mqtt user name
+mqtt_pass = "xxxxxx"                            #mqtt user pass
+mqtt_host = "xxxxx"     #mqtt endpoint
+mqtt_clientid = "xxxxx"                          #mqtt client id
 mqtt_topic = "attributes"                           #mqtt publish message topic
 mqtt_push_topic = "command/send/+"                  #mqtt subscrib message topic
 
