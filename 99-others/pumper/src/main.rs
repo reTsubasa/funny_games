@@ -1,8 +1,4 @@
 use core::str;
-use std::collections::HashMap;
-use std::env::Args;
-use std::pin::Pin;
-use std::process::Command;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -82,8 +78,10 @@ const PUMPER_FLOW: u32 = 50;
 
 // range of Plant Moisture Meter in water & air
 // as the max & min value can read from adcpin
-const MOISTURE_IN_WATER: u16 = 300;
-const MOISTURE_IN_AIR: u16 = 1500;
+
+// only fit for "Capacltlve Soll Molsture Sensor v2.0"
+const MOISTURE_IN_WATER: u16 = 1560;
+const MOISTURE_IN_AIR: u16 = 2837;
 
 // sample time
 // as ms
@@ -139,7 +137,7 @@ fn main() -> anyhow::Result<()> {
 
     // Plant Moisture Meter
     // One-shot ADC get the sample data from adc
-    // use pin: gpio1
+    // use pin: gpio0
     // example https://github.com/esp-rs/esp-idf-hal/blob/master/examples/adc.rs
     // let config = AdcContConfig::default();
     // let adc_1_channel_0 = Attenuated::db11(peripherals.pins.gpio0);
@@ -184,7 +182,7 @@ fn main() -> anyhow::Result<()> {
         // should do adc adjust,make moisture into 2 stage, low value enable pumper water
         // and high value do next check
         //
-        // filter： do read value 10 times in 30 secs
+        // filter： do read value 10 times in 10 secs
         // then cal total sum of 10 times，and sub max&min value，
         // todo! make pumper threshold tobe a var
 
@@ -193,7 +191,7 @@ fn main() -> anyhow::Result<()> {
         for mut _i in 0..10 {
             let value = adc_1_channel_0.read(&mut adc)?;
             moistures.push(value);
-            FreeRtos::delay_ms(3000);
+            FreeRtos::delay_ms(1000);
             _i += 1;
         }
         let min_value = *moistures.iter().min().unwrap_or(&0);
@@ -201,6 +199,12 @@ fn main() -> anyhow::Result<()> {
         let moisture = (moistures.iter().sum::<u16>() - min_value - max_value) / 8;
         info!("sample moistures: {:?}", moistures);
         info!("average moisture: {}", moisture);
+
+        // adjust moistures
+        // commet for real run
+        // let value = adc_1_channel_0.read(&mut adc)?;
+        // info!("sample moistures: {:?}", value);
+
 
         // commet "match xxx" code if you adjust Plant Moisture Meter threshold
         match moisture {
