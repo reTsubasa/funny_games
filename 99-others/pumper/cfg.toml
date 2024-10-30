@@ -1,0 +1,12 @@
+[pumper]
+wifi_ssid = "EBANG"
+wifi_psk = "Ebonfx@2024"
+
+mqtt_user = "7x5te99kcd9a6c1f"
+mqtt_pass = "Iq4NbctlTQ"
+mqtt_host = "mqtt://sh-3-mqtt.iot-api.com:1883"
+mqtt_clientid = "6bcxovwq"
+mqtt_topic = "attributes"
+mqtt_subscribe_topic = "command/send/+"
+
+pumper_volume = "50"
