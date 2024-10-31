@@ -1,28 +1,49 @@
 use core::str;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-use anyhow::Result;
+use anyhow::{Result,Error};
+use dht_sensor::{dht11, DhtReading};
 use esp_idf_svc::eventloop::EspSystemEventLoop;
-use esp_idf_svc::hal::{adc, gpio};
+use esp_idf_svc::hal::{adc, delay, gpio};
 use esp_idf_svc::hal::adc::attenuation::DB_11;
 use esp_idf_svc::hal::adc::oneshot::config::AdcChannelConfig;
 use esp_idf_svc::hal::adc::oneshot::{AdcChannelDriver, AdcDriver};
-use esp_idf_svc::hal::delay::FreeRtos;
+use esp_idf_svc::hal::delay::{Delay, FreeRtos};
 use esp_idf_svc::hal::gpio::{AnyIOPin, Gpio0, InputOutput, Level, PinDriver, Pins};
 use esp_idf_svc::hal::prelude::Peripherals;
-use esp_idf_svc::http::status;
 use esp_idf_svc::mqtt;
 use esp_idf_svc::mqtt::client::QoS::AtMostOnce;
 use esp_idf_svc::mqtt::client::{EspMqttClient, EventPayload, MqttProtocolVersion};
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use esp_idf_svc::sys::EspError;
+use esp_idf_svc::sys::{payload_transfer_func, EspError};
 use esp_idf_svc::wifi::{BlockingWifi, ClientConfiguration, Configuration, EspWifi};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize,Debug)]
+struct MqttMsg{
+    solid_humidity:Option<u32>,
+    relay:Option<bool>,
+    amount_total:Option<u32>,
+    environment_temperature:Option<u32>,
+    environment_humidity:Option<u32>,
+}
+impl MqttMsg {
+    fn new()->Self {
+        Self{
+            solid_humidity:None,
+            relay:None,
+            amount_total:None,
+            environment_humidity:None,
+            environment_temperature:None,
+        }
+    }
+}
+
+
+#[derive(Serialize, Deserialize,Debug)]
 struct SolidHumidity {
-    solid_humidity: f64,
+    solid_humidity: u32,
 }
 #[derive(Serialize, Deserialize)]
 struct PumperStatus {
@@ -37,28 +58,11 @@ impl PumperStatus {
 struct PumperDriver<'a>{
     pin_drvier:PinDriver<'a, AnyIOPin, InputOutput>,
 }
-// impl PumperDriver {
-//     fn new(pin:AnyIOPin) ->Self {
-//         match PinDriver::input_output(pin) {
-//             Ok(pin_driver) => {
-//                 Self{
-//                     pin_drvier:pin_driver
-//                 }
-//             },
-//             Err(e) => error!("set pin driver error:{}",e),
-//         }
-//         PeripheralRef
-         
-//     }
-//     fn start() {
-        
-//     }
-    
-// }
+
 
 #[derive(Serialize, Deserialize)]
 struct WateringAmount {
-    amount: u32,
+    amount_total: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -80,13 +84,13 @@ const PUMPER_FLOW: u32 = 50;
 // as the max & min value can read from adcpin
 
 // only fit for "Capacltlve Soll Molsture Sensor v2.0"
-const MOISTURE_IN_WATER: u16 = 1560;
+const MOISTURE_IN_WATER: u16 = 1450;
 const MOISTURE_IN_AIR: u16 = 2837;
 
 // sample time
 // as ms
 // default 30s( 30*1000 )
-const LOOP_INTERVAL: u32 = 30 * 1000;
+const LOOP_INTERVAL: u32 = 15 * 1000;
 
 #[toml_cfg::toml_config]
 pub struct Config {
@@ -151,6 +155,14 @@ fn main() -> anyhow::Result<()> {
     let mut adc: AdcChannelDriver<'_, Gpio0, &AdcDriver<'_, esp_idf_svc::hal::adc::ADC1>> =
         AdcChannelDriver::new(&adc_1_channel_0, peripherals.pins.gpio0, &config)?;
 
+    // dht11
+    let pin = peripherals.pins.gpio3;
+    let mut dht_sensor = gpio::PinDriver::input_output(pin)?;
+    dht_sensor.set_high().ok();
+    FreeRtos::delay_ms(1000);
+
+
+    
     // Process Init
     let app_config = CONFIG;
     // connect wifi
@@ -161,22 +173,30 @@ fn main() -> anyhow::Result<()> {
     // init mqtt client
     let mut client = mqtt_client_connect()?;
 
+    // delays
+    
+
     // loop
     loop {
-        info!("start loop");
+        info!("start loop at:{:?}",SystemTime::now());
+        let mut mqtt_msg = MqttMsg::new();
 
-        // publish relay status
-        let mut args = PumperStatus::new(true);
+        // get relay status
         match relay_pin.get_level() {
-            Level::Low => args.relay = false,
-            _ => (),
+            Level::Low => mqtt_msg.relay = Some(false),
+            Level::High => mqtt_msg.relay = Some(true),
         }
-        client.enqueue(
-            &app_config.mqtt_topic,
-            AtMostOnce,
-            false,
-            serde_json::to_string(&args)?.as_bytes(),
-        )?;
+        // get dht11 
+        match dht11::Reading::read(&mut delay::Ets , &mut dht_sensor) {
+            Ok(res) => {
+                mqtt_msg.environment_temperature = Some(res.temperature as u32);
+                mqtt_msg.environment_humidity = Some(res.relative_humidity as u32);
+            },
+            Err(e) => {
+                error!("dht11 error:{:?}",e);
+                continue;
+            },
+        }
 
         // read adc
         // should do adc adjust,make moisture into 2 stage, low value enable pumper water
@@ -189,82 +209,100 @@ fn main() -> anyhow::Result<()> {
         let mut moistures = Vec::new();
 
         for mut _i in 0..10 {
-            let value = adc_1_channel_0.read(&mut adc)?;
-            moistures.push(value);
+            match adc_1_channel_0.read(&mut adc) {
+                Ok(val) => {
+                    if val < MOISTURE_IN_WATER || val > MOISTURE_IN_AIR {
+                        error!("moisture sensor error:{}",val);
+                        // restart();
+                    }
+                    moistures.push(val);
+                },
+                Err(e) => error!("read adc error:{}",e),
+            }
+            
             FreeRtos::delay_ms(1000);
             _i += 1;
         }
-        let min_value = *moistures.iter().min().unwrap_or(&0);
-        let max_value = *moistures.iter().max().unwrap_or(&65535);
-        let moisture = (moistures.iter().sum::<u16>() - min_value - max_value) / 8;
-        info!("sample moistures: {:?}", moistures);
-        info!("average moisture: {}", moisture);
+        let humidity:u32;
+        if moistures.len() == 10 {
+            let min_value = *moistures.iter().min().unwrap_or(&MOISTURE_IN_WATER);
+            let max_value = *moistures.iter().max().unwrap_or(&MOISTURE_IN_AIR);
+            let moisture = (moistures.iter().sum::<u16>() - min_value - max_value) / 8;
+            humidity = convert_moisture_to_humidity_u16(moisture);
+
+        }else {
+            error!("read moisture sensor 10 times");
+            continue;
+        }
+        
+        info!("humidity:{}",humidity);
+        mqtt_msg.solid_humidity = Some(humidity);
+
+        match mqtt_send_msg(&mut client,&mut mqtt_msg){
+            Ok(_) => {
+                info!("send step 1");
+            },
+            Err(e) => error!("mqtt client error:{}",e),
+        }
 
         // adjust moistures
         // commet for real run
         // let value = adc_1_channel_0.read(&mut adc)?;
         // info!("sample moistures: {:?}", value);
 
+        if  mqtt_msg.environment_temperature != None &&  mqtt_msg.environment_temperature < Some(2){
+            continue;
+        }
 
         // commet "match xxx" code if you adjust Plant Moisture Meter threshold
-        match moisture {
-            0..300 => {
-                info!("start pumper");
-                relay_pin.set_high()?;
-                let args = PumperStatus::new(true);
-
-                client.enqueue(
-                    &app_config.mqtt_topic,
-                    AtMostOnce,
-                    false,
-                    serde_json::to_string(&args)?.as_bytes(),
-                )?;
+        match humidity {
+            0..30 => {
+                
                 // run pumper time
-                let time = convert_volume_to_pumperworking_time_ms(
-                    app_config.pumper_volume.parse::<u32>()?,
+                let volume = app_config.pumper_volume.parse::<u32>()?;
+                let time = convert_volume_to_pumperworking_time_ms(volume
                 );
                 info!(
-                    "pump water: {}ml, working time: {}ms",
+                    "pump starting!\nwater: {}ml, working time: {}ms",
                     app_config.pumper_volume, time
                 );
-                FreeRtos::delay_ms(time);
+
+                relay_pin.set_high()?;
+                mqtt_msg.relay = Some(true);
+
+                // mqtt publish gap
+                FreeRtos::delay_ms(5000);
+                match mqtt_send_msg(&mut client,&mut mqtt_msg){
+                    Ok(_) => {
+                        info!("send step 2");
+                    },
+                    Err(e) => error!("mqtt client error:{}",e),
+                };
+
+                FreeRtos::delay_ms(time -5000);
 
                 while let Level::High = relay_pin.get_level(){
-                    relay_pin.set_low()?;
+                    relay_pin.set_low().ok();
                     FreeRtos::delay_ms(100);
                 }
                 info!("pump stopped!");
 
-                let args = PumperStatus::new(false);
-                client.enqueue(
-                    &app_config.mqtt_topic,
-                    AtMostOnce,
-                    false,
-                    serde_json::to_string(&args)?.as_bytes(),
-                )?;
+                mqtt_msg.relay = Some(false);
+                mqtt_msg.amount_total = Some(volume);
 
-                let args = WateringAmount{amount:app_config.pumper_volume.parse::<u32>()?};
-                client.enqueue(
-                    &app_config.mqtt_topic,
-                    AtMostOnce,
-                    false,
-                    serde_json::to_string(&args)?.as_bytes(),
-                )?;
+                match mqtt_send_msg(&mut client,&mut mqtt_msg){
+                    Ok(_) => {
+                        info!("send step 3");
+                    },
+                    Err(e) => error!("mqtt client error:{}",e),
+                }
                 
 
             }
-            300.. => {
+            30.. => {
                 info!("skip run pumper");
             }
         }
-        // publish SolidHumidity
-        let args = SolidHumidity{solid_humidity:convert_moisture_to_humidity(moisture)};
-        client.enqueue(
-            &app_config.mqtt_topic,
-            AtMostOnce,
-            false,
-            serde_json::to_string(&args)?.as_bytes(),
-        )?;
 
         // loop interval
         FreeRtos::delay_ms(LOOP_INTERVAL);
@@ -308,7 +346,7 @@ fn mqtt_client_connect() -> Result<EspMqttClient<'static>> {
     // mqtt client
     let app_config = CONFIG;
 
-    let mut client: EspMqttClient<'static> = EspMqttClient::new_cb(
+    let mut client: EspMqttClient = EspMqttClient::new_cb(
         app_config.mqtt_host,
         &mqtt::client::MqttClientConfiguration {
             client_id: Some(app_config.mqtt_clientid),
@@ -336,6 +374,7 @@ fn mqtt_client_connect() -> Result<EspMqttClient<'static>> {
         },
     )?;
 
+
     let mut i: u32 = 0;
     loop {
         match client.subscribe(app_config.mqtt_subscribe_topic, AtMostOnce) {
@@ -354,10 +393,37 @@ fn mqtt_client_connect() -> Result<EspMqttClient<'static>> {
     Ok(client)
 }
 
-// convert adc value moisture to humidity percent value
-fn convert_moisture_to_humidity(moisture: u16) -> f64 {
-    let a = (moisture as f64 - MOISTURE_IN_WATER as f64) / MOISTURE_IN_AIR as f64;
-    return (a * 10.0).round();
+fn mqtt_send_msg(client:&mut EspMqttClient<'static>,mqtt_msg:&mut MqttMsg)->Result<(),Error>{
+    let app_config = CONFIG;
+    match serde_json::to_string(&mqtt_msg){
+        Ok(payload) => {
+            match client.enqueue(
+                &app_config.mqtt_topic,
+                AtMostOnce,
+                false,
+                payload.as_bytes(),
+            ){
+                Ok(_) => {
+                    info!("send mqtt msg:{}",payload);
+                    return Ok(());
+                },
+                Err(e) => {
+                    error!("mqtt client error:{}",e);
+                    return Err(e.into());
+                },
+            }
+        },
+        Err(e) => {
+            error!("Serialize msg error:{}",e);
+            return Err(e.into());
+        },
+    }
+    
+}
+
+fn convert_moisture_to_humidity_u16(moisture: u16) -> u32 {
+    let a = (MOISTURE_IN_AIR as u32  - moisture as u32 ) *100  / MOISTURE_IN_WATER as u32;
+    return a;
 }
 
 // deal commands recieved from cloud
