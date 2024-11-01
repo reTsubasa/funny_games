@@ -179,7 +179,16 @@ fn main() -> anyhow::Result<()> {
     // loop
     loop {
         info!("start loop at:{:?}",SystemTime::now());
+        // check wifi status
+        wifi_health_checker(&mut wifi);
+
+        // init mqtt msg struct
         let mut mqtt_msg = MqttMsg::new();
+
+
+        // may use a struct hold all device handler,like a tree
+        // may much much better
+        // may do better at next version 
 
         // get relay status
         match relay_pin.get_level() {
@@ -340,6 +349,31 @@ fn wifi_connect(wifi: &mut BlockingWifi<EspWifi>) -> Result<(), EspError> {
     }
 
     Ok(())
+}
+
+// wifi healthy check
+// if status down re-connect
+fn wifi_health_checker(wifi:&mut BlockingWifi<EspWifi>) {
+    if !wifi_is_ok(wifi) {
+        while let Some(_true) =  wifi.is_started().ok() {
+            let _ = wifi.stop();
+        };
+
+        while let Err(_) = wifi_connect(wifi) {
+            let _ = wifi_connect(wifi);
+        }
+    }
+    info!("wifi reconnected!!");
+}
+
+// check if wifi status is ok
+fn wifi_is_ok(wifi:&mut BlockingWifi<EspWifi>) -> bool{
+    match wifi.is_up() {
+        Ok(status) => {
+            return status
+        },
+        Err(_) => false,
+    }
 }
 
 fn mqtt_client_connect() -> Result<EspMqttClient<'static>> {
